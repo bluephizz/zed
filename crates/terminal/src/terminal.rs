@@ -70,8 +70,8 @@ use crate::alacritty::{
     scroll_display, scroll_to_point, search_matches, selection_text, set_default_cursor_style,
     set_selection as set_term_selection, shrink_to_used, spawn_event_loop,
     toggle_vi_mode as toggle_term_vi_mode, total_lines, update_selection as update_term_selection,
-    update_selection_to_vi_cursor, update_vi_cursor_for_scroll, used_lines, vi_goto_point,
-    vi_motion,
+    update_selection_to_vi_cursor, update_vi_cursor_for_scroll, used_lines, vi_cursor_point,
+    vi_goto_point, vi_motion,
 };
 use crate::mappings::colors::to_vte_rgb;
 use crate::mappings::keys::to_esc_str;
@@ -643,6 +643,8 @@ actions!(
         ToggleViMode,
         /// Selects all text in the terminal.
         SelectAll,
+        /// Opens the hyperlink at the vi cursor in vi mode.
+        OpenViHyperlink,
     ]
 );
 
@@ -715,6 +717,9 @@ enum InternalEvent {
     ToggleViMode,
     ViMotion(ViMotion),
     MoveViCursorToPoint(Point),
+    ClearHyperlink,
+    FindViHyperlink,
+    OpenViHyperlink,
 }
 
 type ClipboardFormatter = Arc<dyn Fn(&str) -> String + Sync + Send + 'static>;
@@ -1883,6 +1888,59 @@ impl Terminal {
                 let history_size = term.history_size();
                 self.process_hyperlink(hyperlink.clone(), *open, history_size, cx);
             }
+            InternalEvent::ClearHyperlink => {
+                self.clear_hyperlink(cx);
+            }
+            InternalEvent::FindViHyperlink => {
+                let vi_point = vi_cursor_point(term);
+                if let Some(hyperlink) = find_from_terminal_point(
+                    term,
+                    vi_point,
+                    &mut self.hyperlink_regex_searches,
+                    self.path_style,
+                ) {
+                    let history_size = term.history_size();
+                    self.process_hyperlink(hyperlink, false, history_size, cx);
+                } else {
+                    self.clear_hyperlink(cx);
+                }
+            }
+            InternalEvent::OpenViHyperlink => {
+                trace!("Opening vi hyperlink");
+                let vi_point = vi_cursor_point(term);
+                let hyperlink = find_from_terminal_point(
+                    term,
+                    vi_point,
+                    &mut self.hyperlink_regex_searches,
+                    self.path_style,
+                )
+                .or_else(|| {
+                    find_from_terminal_point(
+                        term,
+                        self.last_content.cursor.point,
+                        &mut self.hyperlink_regex_searches,
+                        self.path_style,
+                    )
+                })
+                .or_else(|| {
+                    self.last_content
+                        .last_hovered_word
+                        .as_ref()
+                        .and_then(|hovered| {
+                            find_from_terminal_point(
+                                term,
+                                hovered.word_match.start,
+                                &mut self.hyperlink_regex_searches,
+                                self.path_style,
+                            )
+                        })
+                });
+
+                if let Some(hyperlink) = hyperlink {
+                    let history_size = term.history_size();
+                    self.process_hyperlink(hyperlink, true, history_size, cx);
+                }
+            }
         }
     }
 
@@ -2354,7 +2412,16 @@ impl Terminal {
     }
 
     pub fn toggle_vi_mode(&mut self) {
+        if self.vi_mode_enabled {
+            self.events.push_back(InternalEvent::ClearHyperlink);
+        }
         self.events.push_back(InternalEvent::ToggleViMode);
+    }
+
+    pub fn open_vi_hyperlink(&mut self) {
+        if self.vi_mode_enabled {
+            self.events.push_back(InternalEvent::OpenViHyperlink);
+        }
     }
 
     pub fn vi_motion(&mut self, keystroke: &Keystroke) {
@@ -2397,6 +2464,11 @@ impl Terminal {
             self.events
                 .push_back(InternalEvent::UpdateSelection(cursor_pos));
             self.events.push_back(InternalEvent::ViMotion(motion));
+            if keystroke.modifiers.secondary() || keystroke.modifiers.control {
+                self.events.push_back(InternalEvent::FindViHyperlink);
+            } else {
+                self.events.push_back(InternalEvent::ClearHyperlink);
+            }
             return;
         }
 
@@ -2418,6 +2490,11 @@ impl Terminal {
 
         if let Some(scroll_motion) = scroll_motion {
             self.events.push_back(InternalEvent::Scroll(scroll_motion));
+            if keystroke.modifiers.secondary() || keystroke.modifiers.control {
+                self.events.push_back(InternalEvent::FindViHyperlink);
+            } else {
+                self.events.push_back(InternalEvent::ClearHyperlink);
+            }
             return;
         }
 
@@ -2452,7 +2529,18 @@ impl Terminal {
                 self.scroll_to_bottom();
                 self.toggle_vi_mode();
             }
+            "enter" | "return" => {
+                if keystroke.modifiers.secondary() || keystroke.modifiers.control {
+                    self.events.push_back(InternalEvent::OpenViHyperlink);
+                }
+            }
             _ => {}
+        }
+
+        if keystroke.modifiers.secondary() || keystroke.modifiers.control {
+            self.events.push_back(InternalEvent::FindViHyperlink);
+        } else {
+            self.events.push_back(InternalEvent::ClearHyperlink);
         }
     }
 
@@ -2481,6 +2569,16 @@ impl Terminal {
         window: &Window,
         cx: &mut Context<Self>,
     ) {
+        if self.vi_mode_enabled {
+            if modifiers.secondary() || modifiers.control {
+                self.events.push_back(InternalEvent::FindViHyperlink);
+            } else {
+                self.clear_hyperlink(cx);
+            }
+            cx.notify();
+            return;
+        }
+
         self.schedule_find_hyperlink(*modifiers, window.mouse_position(), cx);
     }
 
@@ -2608,6 +2706,10 @@ impl Terminal {
         position: GpuiPoint<Pixels>,
         cx: &mut Context<Self>,
     ) {
+        if self.vi_mode_enabled {
+            return;
+        }
+
         if self.selection_phase == SelectionPhase::Selecting
             || !modifiers.secondary()
             || !self.last_content.terminal_bounds.bounds.contains(&position)

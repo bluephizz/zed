@@ -1360,6 +1360,12 @@
     },
   },
   {
+    "context": "Terminal && vi_mode",
+    "bindings": {
+      "ctrl-enter": "terminal::OpenViHyperlink",
+    },
+  },
+  {
     "context": "AgentPanel > Terminal",
     "use_key_equivalents": true,
     "bindings": {

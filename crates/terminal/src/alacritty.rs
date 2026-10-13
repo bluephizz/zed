@@ -1025,6 +1025,10 @@ pub(super) fn update_selection_to_vi_cursor(term: &mut Term<ZedListener>) -> Opt
     Some(terminal_point_from_alacritty(point))
 }
 
+pub(super) fn vi_cursor_point(term: &Term<ZedListener>) -> Point {
+    terminal_point_from_alacritty(term.vi_mode_cursor.point)
+}
+
 pub(super) fn find_from_terminal_point(
     term: &AlacrittyTerm,
     point: Point,

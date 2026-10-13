@@ -1334,8 +1334,8 @@ impl Element for TerminalElement {
                     terminal.set_size(dimensions);
                     terminal.sync(window, cx);
 
-                    if window.modifiers().secondary()
-                        && bounds.contains(&window.mouse_position())
+                    if (window.modifiers().secondary() || window.modifiers().control)
+                        && (bounds.contains(&window.mouse_position()) || terminal.vi_mode_enabled())
                         && let Some(registered_hover) = self.terminal_view.read(cx).hover.as_ref()
                     {
                         if let Some(last_hovered_word) =

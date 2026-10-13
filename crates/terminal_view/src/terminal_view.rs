@@ -33,8 +33,8 @@ use std::{
 };
 use task::TaskId;
 use terminal::{
-    Clear, Copy, Event, HoveredWord, MaybeNavigationTarget, Modes, MouseInputMode, Paste,
-    PasteText, Point, Range, ScrollLineDown, ScrollLineUp, ScrollPageDown, ScrollPageUp,
+    Clear, Copy, Event, HoveredWord, MaybeNavigationTarget, Modes, MouseInputMode, OpenViHyperlink,
+    Paste, PasteText, Point, Range, ScrollLineDown, ScrollLineUp, ScrollPageDown, ScrollPageUp,
     ScrollToBottom, ScrollToTop, Search, ShowCharacterPalette, TaskState, TaskStatus, Terminal,
     TerminalBounds, ToggleViMode,
     terminal_settings::{CursorShape, TerminalSettings},
@@ -912,6 +912,21 @@ impl TerminalView {
         cx.notify();
     }
 
+    fn open_vi_hyperlink(
+        &mut self,
+        _: &OpenViHyperlink,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.terminal.read(cx).vi_mode_enabled() {
+            self.terminal.update(cx, |term, cx| {
+                term.open_vi_hyperlink();
+                term.sync(window, cx);
+            });
+            cx.notify();
+        }
+    }
+
     pub fn should_show_cursor(&self, focused: bool, cx: &mut Context<Self>) -> bool {
         // Hide cursor when in embedded mode and not focused (read-only output like Agent panel)
         if let TerminalMode::Embedded { .. } = &self.mode {
@@ -1395,6 +1410,18 @@ impl TerminalView {
         self.clear_bell(cx);
         self.pause_cursor_blinking(window, cx);
 
+        if self.terminal.read(cx).vi_mode_enabled()
+            && matches!(event.keystroke.key.as_str(), "enter" | "return")
+            && (event.keystroke.modifiers.secondary() || event.keystroke.modifiers.control)
+        {
+            self.terminal.update(cx, |term, cx| {
+                term.open_vi_hyperlink();
+                term.sync(window, cx);
+            });
+            cx.stop_propagation();
+            return;
+        }
+
         if event.prefer_character_input
             && event.keystroke.key_char.is_some()
             && !self.terminal.read(cx).vi_mode_enabled()
@@ -1485,6 +1512,7 @@ impl Render for TerminalView {
             .on_action(cx.listener(TerminalView::scroll_to_top))
             .on_action(cx.listener(TerminalView::scroll_to_bottom))
             .on_action(cx.listener(TerminalView::toggle_vi_mode))
+            .on_action(cx.listener(TerminalView::open_vi_hyperlink))
             .on_action(cx.listener(TerminalView::show_character_palette))
             .on_action(cx.listener(TerminalView::select_all))
             .on_action(cx.listener(TerminalView::rerun_task))
@@ -2553,6 +2581,126 @@ mod tests {
             terminal
                 .update(&mut cx, |terminal, _| terminal.take_input_log())
                 .is_empty()
+        );
+    }
+
+    #[gpui::test]
+    async fn vi_mode_ctrl_enter_opens_hyperlink(cx: &mut TestAppContext) {
+        let (project, _workspace, window_handle) = init_test_with_window(cx).await;
+        let (_pane, terminal, _terminal_view) =
+            add_display_only_terminal(&project, window_handle, true, true, cx);
+        let mut cx = VisualTestContext::from_window(window_handle.into(), cx);
+
+        let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let events_clone = events.clone();
+        cx.update(|_, cx| {
+            cx.subscribe(&terminal, move |_, event: &terminal::Event, _| {
+                events_clone.lock().unwrap().push(event.clone());
+            })
+            .detach();
+        });
+
+        cx.update(|window, cx| {
+            terminal.update(cx, |terminal, cx| {
+                terminal.write_output(b"https://zed.dev\n", cx);
+                terminal.sync(window, cx);
+            });
+            window.dispatch_action(Box::new(ToggleViMode), cx);
+        });
+        cx.run_until_parked();
+
+        assert!(terminal.read_with(&cx, |terminal, _| terminal.vi_mode_enabled()));
+
+        // Move cursor up to line 0 where the URL is
+        cx.update(|window, cx| {
+            window.dispatch_action(Box::new(SendKeystroke("k".into())), cx);
+        });
+        cx.run_until_parked();
+
+        // Verify that plain enter WITHOUT ctrl does NOT open the hyperlink
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+        assert!(
+            !events.lock().unwrap().iter().any(|e| matches!(e, terminal::Event::Open(_))),
+            "plain enter in vi mode should not open hyperlink, got {:?}",
+            events.lock().unwrap()
+        );
+
+        // Verify holding ctrl highlights the link under vi cursor
+        cx.update(|window, cx| {
+            terminal.update(cx, |terminal, cx| {
+                terminal.try_modifiers_change(&gpui::Modifiers::control(), window, cx);
+                terminal.sync(window, cx);
+            });
+        });
+        cx.run_until_parked();
+        assert!(
+            terminal.read_with(&cx, |term, _| term.last_content().last_hovered_word.is_some()),
+            "holding ctrl in vi mode should highlight hyperlink at vi cursor"
+        );
+
+        // Verify releasing ctrl clears the hyperlink highlight
+        cx.update(|window, cx| {
+            terminal.update(cx, |terminal, cx| {
+                terminal.try_modifiers_change(&gpui::Modifiers::none(), window, cx);
+                terminal.sync(window, cx);
+            });
+        });
+        cx.run_until_parked();
+        assert!(
+            terminal.read_with(&cx, |term, _| term.last_content().last_hovered_word.is_none()),
+            "releasing ctrl in vi mode should clear hyperlink highlight"
+        );
+
+        // Simulate ctrl-enter opens the hyperlink
+        cx.simulate_keystrokes("ctrl-enter");
+        cx.run_until_parked();
+
+        let recorded = events.lock().unwrap().clone();
+        assert!(
+            recorded.iter().any(|e| matches!(e, terminal::Event::Open(terminal::MaybeNavigationTarget::Url(url)) if url == "https://zed.dev")),
+            "expected Event::Open for https://zed.dev, got {:?}",
+            recorded
+        );
+
+        // Also test a second URL (file:// URL which is resolved as PathLike)
+        cx.update(|window, cx| {
+            terminal.update(cx, |terminal, cx| {
+                terminal.write_output(b"file:///path/to/test.rs\n", cx);
+                terminal.sync(window, cx);
+            });
+        });
+        cx.run_until_parked();
+
+        cx.update(|window, cx| {
+            // Move cursor down to line 1 where the file URL was written
+            window.dispatch_action(Box::new(SendKeystroke("j".into())), cx);
+            window.dispatch_action(Box::new(SendKeystroke("0".into())), cx);
+        });
+        cx.run_until_parked();
+
+        cx.simulate_keystrokes("ctrl-enter");
+        cx.run_until_parked();
+
+        let recorded = events.lock().unwrap().clone();
+        assert!(
+            recorded.iter().any(|e| matches!(e, terminal::Event::Open(terminal::MaybeNavigationTarget::PathLike(p)) if p.maybe_path.contains("/path/to/test.rs"))),
+            "expected Event::Open for file path, got {:?}",
+            recorded
+        );
+
+        // Also verify window.dispatch_action(Box::new(terminal::OpenViHyperlink), cx) works
+        events.lock().unwrap().clear();
+        cx.update(|window, cx| {
+            window.dispatch_action(Box::new(terminal::OpenViHyperlink), cx);
+        });
+        cx.run_until_parked();
+
+        let recorded = events.lock().unwrap().clone();
+        assert!(
+            recorded.iter().any(|e| matches!(e, terminal::Event::Open(terminal::MaybeNavigationTarget::PathLike(p)) if p.maybe_path.contains("/path/to/test.rs"))),
+            "expected Event::Open for file path via OpenViHyperlink action, got {:?}",
+            recorded
         );
     }
 

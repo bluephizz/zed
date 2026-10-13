@@ -115,7 +115,8 @@ fn possibly_open_target(
     cx: &mut Context<TerminalView>,
     #[cfg(test)] background_path_checks: BackgroundPathChecks,
 ) -> Task<Result<Option<OpenTarget>>> {
-    if terminal_view.hover.is_none() {
+    let in_vi_mode = terminal_view.terminal.read(cx).vi_mode_enabled();
+    if terminal_view.hover.is_none() && !in_vi_mode {
         return Task::ready(Ok(None));
     }
     let workspace = workspace.clone();
